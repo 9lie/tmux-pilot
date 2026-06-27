@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+# tmux-pilot — tmux session launcher + auto layout/claude-session save & restore
+#
+# 用法:
+#   tmux-pilot            智能启动：选择/恢复 session，并拉起后台监控
+#   tmux-pilot save       立即保存所有 session 的快照
+#   tmux-pilot restore X  从快照重建 session X（detached）
+#   tmux-pilot panes      显示每个 claude 在哪个 pane（含 sessionId）
+#   tmux-pilot status     查看监控状态 + 快照列表
+#   tmux-pilot history    查看/追溯历史版本快照（带时间戳，永久保留）
+#   tmux-pilot monitor    手动启动后台监控（一般自动启动，无需手动）
+#   tmux-pilot stop       停止后台监控
+#   tmux-pilot help       帮助
+#
+# 依赖: bash 4+, tmux 3+。可选: claude CLI（会话捕获/续接）, jq（更快解析）。
+
+set -uo pipefail
+
+# ============================================================
+# 配置（集中在此，均可用环境变量覆盖）
+# ============================================================
+# 数据 / 快照目录
+PILOT_DATA_DIR="${PILOT_DATA_DIR:-$HOME/.local/share/tmux-pilot}"
+PILOT_SNAP_DIR="$PILOT_DATA_DIR/snapshots"
+PID_FILE="$PILOT_DATA_DIR/monitor.pid"
+LOG_FILE="$PILOT_DATA_DIR/monitor.log"
+
+# 后台监控自动保存的间隔（秒）
+INTERVAL="${PILOT_SAVE_INTERVAL:-60}"
+
+# Claude(-compatible) CLI 可执行名。用于会话发现（`<cmd> agents --json`）与
+# 恢复时缺省 fallback。若你用的是兼容 CLI（命令名不同但接口一致），
+# 设 PILOT_CLAUDE_CMD 指向它即可，脚本不写死任何具体命令名。
+CLAUDE_CMD="${PILOT_CLAUDE_CMD:-claude}"
+
+# Claude(-compatible) CLI 的数据目录（存放 projects/<cwd>/<sid>.jsonl，
+# 用于判定 session 是否有真实对话内容）。兼容 CLI 若用别的目录，在此覆盖。
+CLAUDE_DATA_DIR="${PILOT_CLAUDE_DATA_DIR:-$HOME/.claude}"
+
+# 恢复时可直接重新拉起的「已知命令」白名单（空格分隔）。
+KNOWN_CMDS="${PILOT_KNOWN_CMDS:-nvim vim vi nano less man top htop btop}"
+
+# 启动时探测 tmux server 是否响应的超时（秒）。卡死的 tmux 会让
+# `tmux info` 永久挂起，超过这个时间即判定为「无响应」。
+PROBE_TIMEOUT="${PILOT_PROBE_TIMEOUT:-3}"
+
+# 历史版本归档：内容有变更时，额外在 history/<session>/ 下存一份带时间戳的
+# 不可变副本（原始信息永久可追溯）。设为 0 关闭。保留份数见 PILOT_HISTORY_KEEP。
+HISTORY_ENABLED="${PILOT_HISTORY_ENABLED:-1}"
+# 每个 session 最多保留的历史副本数（按时间，超出删最旧）。设为 0 = 不限。
+HISTORY_KEEP="${PILOT_HISTORY_KEEP:-50}"
+
+mkdir -p "$PILOT_SNAP_DIR"
+
+# ============================================================
+# claude 会话探测
+# ============================================================
+
+# 输出 "<pid>\t<sessionId>\t<launch_b64>" 多行；无 claude / 无 CLI 时输出空。
+# launch_b64 = claude 实际启动命令（含可执行名/别名 + 额外参数），
+#   仅剥掉 --resume/-r <id> 与裸 sessionId，base64 编码后存。
+#   这样恢复时能原样还原用户用的别名（claude / cc / claude-code）+ 参数。
+# 退出码: 0=探测成功（输出 0 行或多行都算成功，含「确实没有 claude」）；
+#          2=探测失败（CLI 调用出错/异常）——调用方据此跳过本轮保存，避免把
+#            已有快照里的 sessionId 误抹成 "-"。CLI 不存在视为成功(=没有 claude)。
+_claude_pid_session_map() {
+    command -v "$CLAUDE_CMD" >/dev/null 2>&1 || return 0   # 无此 CLI = 没有 claude，正常
+    local json
+    json="$("$CLAUDE_CMD" agents --json 2>/dev/null)" || return 2   # 调用失败 = 探测故障
+    [ -z "$json" ] && return 0                              # 空输出 = 确实没有 claude
+
+    local pairs
+    if command -v jq >/dev/null 2>&1; then
+        pairs="$(printf '%s' "$json" | jq -r '.[] | "\(.pid)\t\(.sessionId)"' 2>/dev/null)"
+        # JSON 非空但 jq 解析不出任何行 → 格式异常，判为探测失败而非「没有 claude」
+        if [ -z "$pairs" ] && printf '%s' "$json" | grep -q '"sessionId"'; then
+            return 2
+        fi
+    else
+        pairs="$(printf '%s' "$json" | awk '
+            /"pid"/      { gsub(/[^0-9]/,"",$0); pid=$0 }
+            /"sessionId"/{ match($0,/[0-9a-f-]{36}/); sid=substr($0,RSTART,RLENGTH); if(pid!=""){print pid"\t"sid; pid=""} }
+        ')"
+    fi
+
+    local pid sid launch lb64
+    while IFS=$'\t' read -r pid sid; do
+        [ -z "$pid" ] && continue
+        launch="$(_claude_extract_launch "$pid")"
+        lb64="$(printf '%s' "$launch" | base64 | tr -d '\n')"
+        printf '%s\t%s\t%s\n' "$pid" "$sid" "$lb64"
+    done <<< "$pairs"
+    return 0
+}
+
+# 从 claude 进程命令行提取「启动命令」：保留可执行名（取 basename，保留别名）
+# 与全部额外参数，仅去掉 --resume/-r <id> 与裸 sessionId。
+# 例: "/usr/local/bin/cc --dangerously-skip-permissions" → "cc --dangerously-skip-permissions"
+#     "claude --resume <id> --model x"                   → "claude --model x"
+_claude_extract_launch() {
+    local pid="$1"
+    local cmdline; cmdline="$(ps -o command= -p "$pid" 2>/dev/null)"
+    [ -z "$cmdline" ] && return 0
+    local -a parts=(); read -r -a parts <<< "$cmdline"
+    [ "${#parts[@]}" -eq 0 ] && return 0
+    local -a out=()
+    # 第一个 token = 可执行名/路径 → 取 basename，保留用户用的别名
+    out+=("$(basename "${parts[0]}")")
+    local i=1 n=${#parts[@]}
+    while [ "$i" -lt "$n" ]; do
+        local tok="${parts[$i]}"
+        case "$tok" in
+            --resume|-r)
+                i=$((i + 2)); continue ;;            # 跳过 flag 和它的值
+            --resume=*)
+                i=$((i + 1)); continue ;;
+            *)
+                # 跳过裸 sessionId（36 位 uuid），其余保留
+                if [[ "$tok" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+                    i=$((i + 1)); continue
+                fi
+                out+=("$tok"); i=$((i + 1)) ;;
+        esac
+    done
+    printf '%s' "${out[*]:-}"
+}
+
+# 给定 pane_pid + claude 映射，回溯进程树找出该 pane 跑的 claude sessionId。
+_claude_session_for_pane() {
+    local pane_pid="$1" map="$2"
+    [ -z "$map" ] && return 0
+    local cpid sid fb64 cur depth
+    while IFS=$'\t' read -r cpid sid fb64; do
+        [ -z "$cpid" ] && continue
+        cur="$cpid"; depth=0
+        while [ -n "$cur" ] && [ "$cur" -gt 1 ] 2>/dev/null; do
+            if [ "$cur" = "$pane_pid" ]; then echo "$sid	$fb64"; return 0; fi
+            cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+            depth=$((depth + 1)); [ "$depth" -gt 25 ] && break
+        done
+    done <<< "$map"
+    return 0
+}
+
+# ============================================================
+# 保存
+# ============================================================
+# 快照格式（TSV，每 session 一个文件 <name>.snap）:
+#   win   <session> <win_idx> <win_name> <layout> <active>
+#   pane  <session> <win_idx> <pane_idx> <cwd> <cmd> <active> <claude_session_id|-> <claude_launch_b64|->
+# 内容有变更时，把快照归档一份带时间戳的不可变副本到 history/<session>/。
+# 与「该 session 现存最新的一份历史」逐字节比较，相同则不写（避免噪音）。
+_archive_snapshot() {
+    [ "$HISTORY_ENABLED" = "1" ] || return 0
+    local s="$1" snap="$2"
+    [ -f "$snap" ] || return 0
+    local hdir="$PILOT_SNAP_DIR/history/$s"
+    mkdir -p "$hdir"
+    # 找现存最新一份历史（文件名按时间戳排序，取最后一个）
+    local latest
+    latest="$(ls "$hdir"/*.snap 2>/dev/null | sort | tail -1)"
+    # 与最新历史相同 → 无变更，不归档
+    if [ -n "$latest" ] && cmp -s "$snap" "$latest"; then
+        return 0
+    fi
+    # 写带时间戳的副本（精确到秒；同秒多次变更追加毫秒/计数避免覆盖）
+    local ts stamp dest
+    ts="$(date '+%Y%m%d-%H%M%S')"
+    dest="$hdir/${ts}.snap"
+    if [ -e "$dest" ]; then
+        local i=1
+        while [ -e "$hdir/${ts}-${i}.snap" ]; do i=$((i + 1)); done
+        dest="$hdir/${ts}-${i}.snap"
+    fi
+    cp -p "$snap" "$dest"
+    # 超出保留份数 → 删最旧
+    if [ "$HISTORY_KEEP" -gt 0 ] 2>/dev/null; then
+        local n; n="$(ls "$hdir"/*.snap 2>/dev/null | wc -l | tr -d ' ')"
+        if [ "$n" -gt "$HISTORY_KEEP" ]; then
+            ls "$hdir"/*.snap 2>/dev/null | sort | head -n "$((n - HISTORY_KEEP))" \
+                | while read -r old; do rm -f "$old"; done
+        fi
+    fi
+}
+
+pilot_save() {
+    local target="${1:-}"
+    tmux info >/dev/null 2>&1 || { echo "tmux server 未运行，跳过保存" >&2; return 1; }
+    local claude_map probe_rc
+    claude_map="$(_claude_pid_session_map)"; probe_rc=$?
+    # 探测故障（CLI 调用异常）：本轮不信任 claude 映射，避免把已有快照的
+    # sessionId 误抹成 "-"。对「旧快照里曾有 claude」的 session 整体跳过本轮保存。
+    local probe_failed=0
+    [ "$probe_rc" -eq 2 ] && probe_failed=1
+
+    local sessions
+    if [ -n "$target" ]; then sessions="$target"
+    else sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); fi
+
+    local s
+    while IFS= read -r s; do
+        [ -z "$s" ] && continue
+        local snap="$PILOT_SNAP_DIR/${s}.snap" tmp="$PILOT_SNAP_DIR/${s}.snap.tmp"
+        # 探测故障且该 session 旧快照里本就含 claude → 跳过，保留旧快照不覆盖
+        if [ "$probe_failed" -eq 1 ] && [ -f "$snap" ] \
+           && awk -F'	' '$1=="pane" && $8!="-" {found=1} END{exit !found}' "$snap"; then
+            echo "claude 探测失败，保留 '$s' 的旧快照（不覆盖）" >&2
+            continue
+        fi
+        : > "$tmp"
+        tmux list-windows -t "$s" -F \
+            'win	#{session_name}	#{window_index}	#{window_name}	#{window_layout}	#{?window_active,1,0}' \
+            2>/dev/null >> "$tmp"
+        local ppid sess win pane cwd cmd active sidflags sid fb64
+        while IFS=$'	' read -r ppid sess win pane cwd cmd active; do
+            [ -z "$ppid" ] && continue
+            sidflags=$(_claude_session_for_pane "$ppid" "$claude_map")
+            sid="${sidflags%%	*}"          # 第一段 = sessionId
+            fb64="${sidflags#*	}"           # 第二段 = launch_b64
+            [ -z "$sid" ] && sid="-"
+            # sidflags 无 tab（即没匹配到 claude）时，fb64 会等于 sid，纠正为 -
+            [ "$fb64" = "$sid" ] && fb64="-"
+            [ -z "$fb64" ] && fb64="-"
+            printf 'pane	%s	%s	%s	%s	%s	%s	%s	%s\n' \
+                "$sess" "$win" "$pane" "$cwd" "$cmd" "$active" "$sid" "$fb64" >> "$tmp"
+        done < <(tmux list-panes -t "$s" -F \
+            '#{pane_pid}	#{session_name}	#{window_index}	#{pane_index}	#{pane_current_path}	#{pane_current_command}	#{?pane_active,1,0}' \
+            2>/dev/null)
+        mv -f "$tmp" "$snap"
+        _archive_snapshot "$s" "$snap"
+    done <<< "$sessions"
+}
+
+pilot_list_snapshots() {
+    ls "$PILOT_SNAP_DIR"/*.snap 2>/dev/null | while read -r f; do basename "$f" .snap; done
+}
+
+# ============================================================
+# 恢复
+# ============================================================
+_shorten_path() { case "$1" in "$HOME"*) echo "~${1#$HOME}";; *) echo "$1";; esac; }
+
+# 命令名是否在「已知可恢复」白名单（$KNOWN_CMDS，空格分隔）内。
+_is_known_cmd() {
+    local c="$1" k
+    for k in $KNOWN_CMDS; do [ "$c" = "$k" ] && return 0; done
+    return 1
+}
+
+# 判断一个 claude session 是否「有内容」（用户真正对话过）。
+# claude 启动即生成 sessionId，但未对话的 session 只有 ai-title/agent-name 等元数据，
+# 没有 type:"user" 行。对这种空 session 执行 --resume 会报「No conversation found」。
+# 判定: $CLAUDE_DATA_DIR/projects/<cwd编码>/<sid>.jsonl 中存在至少一条 "type":"user"。
+# 返回 0=有内容可恢复，1=空或不存在。
+_claude_session_has_content() {
+    local sid="$1" cwd="$2"
+    [ -z "$sid" ] || [ "$sid" = "-" ] && return 1
+    [ -z "$cwd" ] && return 1
+    local enc="${cwd//\//-}"
+    local f="$CLAUDE_DATA_DIR/projects/$enc/$sid.jsonl"
+    [ -f "$f" ] || return 1
+    grep -q '"type":"user"' "$f" 2>/dev/null
+}
+
+_relaunch_pane() {
+    local pane_id="$1" cwd="$2" cmd="$3" sid="$4" lb64="${5:-}"
+    [ -z "$pane_id" ] && return 0
+    # 解码启动命令（含别名 + 参数，如 "cc --dangerously-skip-permissions"）
+    local launch=""
+    if [ -n "$lb64" ] && [ "$lb64" != "-" ]; then
+        launch="$(printf '%s' "$lb64" | base64 --decode 2>/dev/null)"
+    fi
+    # 没捕获到启动命令时退回默认可执行名
+    [ -z "$launch" ] && launch="$CLAUDE_CMD"
+    # 空 session（用户没对话过）→ 不能 --resume，降级为全新启动但保留启动命令
+    if [ "$sid" != "-" ] && [ -n "$sid" ] && ! _claude_session_has_content "$sid" "$cwd"; then
+        tmux send-keys -t "$pane_id" "cd $(printf '%q' "$cwd") && $launch" Enter
+        return 0
+    fi
+    if [ "$sid" != "-" ] && [ -n "$sid" ]; then
+        tmux send-keys -t "$pane_id" "cd $(printf '%q' "$cwd") && $launch --resume $sid" Enter
+        return 0
+    fi
+    # 非 claude pane：已知命令重启，未知仅 cd
+    if _is_known_cmd "$cmd"; then
+        tmux send-keys -t "$pane_id" "cd $(printf '%q' "$cwd") && $cmd" Enter
+    else
+        tmux send-keys -t "$pane_id" "cd $(printf '%q' "$cwd")" Enter
+    fi
+}
+
+pilot_restore() {
+    local s="$1"
+    local snap="$PILOT_SNAP_DIR/${s}.snap"
+    [ -f "$snap" ] || { echo "无快照: $snap" >&2; return 1; }
+    if tmux has-session -t "$s" 2>/dev/null; then
+        echo "session '$s' 已存在，跳过恢复" >&2; return 0
+    fi
+
+    local first=0 win_indices wi
+    win_indices=$(awk -F'\t' '$1=="win"{print $3}' "$snap" | sort -n)
+    while IFS= read -r wi; do
+        [ -z "$wi" ] && continue
+        local wname layout pane_lines win_id idx last_pane_id
+        wname=$(awk -F'\t' -v w="$wi" '$1=="win" && $3==w {print $4}' "$snap")
+        layout=$(awk -F'\t' -v w="$wi" '$1=="win" && $3==w {print $5}' "$snap")
+        pane_lines=$(awk -F'\t' -v w="$wi" '$1=="pane" && $3==w {print $4"\t"$5"\t"$6"\t"$8"\t"$9}' "$snap" | sort -n)
+
+        if [ -z "$pane_lines" ]; then
+            if [ "$first" -eq 0 ]; then tmux new-session -d -s "$s" -n "$wname" -c "$HOME"; first=1
+            else tmux new-window -t "$s" -n "$wname" -c "$HOME"; fi
+            continue
+        fi
+
+        win_id=""; idx=0; last_pane_id=""
+        local pidx pcwd pcmd psid pflags
+        while IFS=$'\t' read -r pidx pcwd pcmd psid pflags; do
+            [ -z "$pidx" ] && continue
+            if [ "$idx" -eq 0 ]; then
+                if [ "$first" -eq 0 ]; then
+                    tmux new-session -d -s "$s" -n "$wname" -c "$pcwd"; first=1
+                    win_id=$(tmux list-windows -t "$s" -F '#{window_id} #{window_name}' | awk -v n="$wname" '$2==n{print $1; exit}')
+                    [ -z "$win_id" ] && win_id=$(tmux list-windows -t "$s" -F '#{window_id}' | head -1)
+                else
+                    win_id=$(tmux new-window -t "$s" -n "$wname" -c "$pcwd" -P -F '#{window_id}')
+                fi
+                last_pane_id=$(tmux list-panes -t "$win_id" -F '#{pane_id}' | head -1)
+            else
+                last_pane_id=$(tmux split-window -t "$win_id" -c "$pcwd" -P -F '#{pane_id}')
+            fi
+            _relaunch_pane "$last_pane_id" "$pcwd" "$pcmd" "$psid" "$pflags"
+            idx=$((idx + 1))
+        done <<< "$pane_lines"
+        [ -n "$layout" ] && [ -n "$win_id" ] && tmux select-layout -t "$win_id" "$layout" 2>/dev/null
+    done <<< "$win_indices"
+}
+
+# ============================================================
+# claude → pane 映射展示
+# ============================================================
+cmd_panes() {
+    tmux info >/dev/null 2>&1 || { echo "tmux server 未运行"; return 1; }
+    local map; map="$(_claude_pid_session_map)"
+    [ -z "$map" ] && { echo "没有正在运行的 claude（或 claude CLI 不可用）"; return 0; }
+
+    printf '%-16s %-10s %-10s %s\n' "TMUX PANE" "WINDOW" "SESSION" "CWD"
+    printf -- '----------------------------------------------------------------------\n'
+    # 建 pane_pid → 位置/窗口名 表
+    local panes_tbl; panes_tbl=$(tmux list-panes -a -F \
+        '#{pane_pid}	#{session_name}:#{window_index}.#{pane_index}	#{window_name}	#{pane_current_path}' 2>/dev/null)
+    local cpid sid fb64
+    while IFS=$'\t' read -r cpid sid fb64; do
+        [ -z "$cpid" ] && continue
+        # 回溯 claude pid 找 pane_pid
+        local cur="$cpid" depth=0 hit=""
+        while [ -n "$cur" ] && [ "$cur" -gt 1 ] 2>/dev/null; do
+            hit=$(awk -F'\t' -v p="$cur" '$1==p{print $2"\t"$3"\t"$4; exit}' <<< "$panes_tbl")
+            [ -n "$hit" ] && break
+            cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+            depth=$((depth + 1)); [ "$depth" -gt 25 ] && break
+        done
+        if [ -n "$hit" ]; then
+            local loc wname path
+            loc=$(cut -f1 <<< "$hit"); wname=$(cut -f2 <<< "$hit"); path=$(cut -f3 <<< "$hit")
+            printf '%-16s %-10s %-10s %s\n' "$loc" "$wname" "${sid:0:8}" "$(_shorten_path "$path")"
+        else
+            printf '%-16s %-10s %-10s %s\n' "(not in tmux)" "" "${sid:0:8}" ""
+        fi
+    done <<< "$map"
+}
+
+# ============================================================
+# 后台监控
+# ============================================================
+_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
+
+monitor_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid; pid=$(cat "$PID_FILE" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# 监控循环本体（被 nohup 在后台调用）
+_monitor_loop() {
+    if monitor_running; then _log "monitor 已在运行，退出"; exit 0; fi
+    echo $$ > "$PID_FILE"
+    _log "monitor 启动 (pid=$$, interval=${INTERVAL}s)"
+    trap '_log "monitor 退出 (pid=$$)"; rm -f "$PID_FILE"' EXIT INT TERM
+    while true; do
+        tmux info >/dev/null 2>&1 || { _log "tmux server 不存在，monitor 退出"; break; }
+        if pilot_save 2>>"$LOG_FILE"; then
+            _log "已保存: $(pilot_list_snapshots | tr '\n' ' ')"
+        else _log "保存失败"; fi
+        sleep "$INTERVAL"
+    done
+}
+
+start_monitor() {
+    monitor_running && return 0
+    # 用自身脚本 + 隐藏子命令 __monitor 在后台拉起循环
+    nohup "$0" __monitor >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+# ============================================================
+# 启动逻辑
+# ============================================================
+_describe_live_session() {
+    local s="$1" map; map="$(_claude_pid_session_map)"
+    tmux list-panes -t "$s" -F \
+        '#{pane_pid}	#{window_index}	#{window_name}	#{pane_index}	#{pane_current_command}	#{pane_current_path}' \
+        2>/dev/null | while IFS=$'\t' read -r ppid widx wname pidx cmd path; do
+        local sidflags sid; sidflags=$(_claude_session_for_pane "$ppid" "$map"); sid="${sidflags%%	*}"
+        local tag=""; [ -n "$sid" ] && tag="  ⟲claude:${sid:0:8}"
+        printf '       └ %s.%s [%s] %s  %s%s\n' "$widx" "$pidx" "$wname" "$cmd" "$(_shorten_path "$path")" "$tag"
+    done
+}
+
+_describe_snapshot() {
+    local s="$1" f="$PILOT_SNAP_DIR/${s}.snap"
+    [ -f "$f" ] || return 0
+    awk -F'\t' '$1=="pane"{print $3"\t"$4"\t"$5"\t"$6"\t"$8}' "$f" | sort -n | \
+    while IFS=$'\t' read -r widx pidx path cmd sid; do
+        local wname; wname=$(awk -F'\t' -v w="$widx" '$1=="win" && $3==w {print $4}' "$f")
+        local tag=""; [ "$sid" != "-" ] && [ -n "$sid" ] && tag="  ⟲claude:${sid:0:8}"
+        printf '       └ %s.%s [%s] %s  %s%s\n' "$widx" "$pidx" "$wname" "$cmd" "$(_shorten_path "$path")" "$tag"
+    done
+}
+
+# 数字选择。$1=kind(live|snap)，其余=名字列表。选中名 → stdout；提示 → stderr。
+choose_session() {
+    local kind="$1"; shift
+    local sessions=("$@") n=$#
+    {
+        echo
+        local i=1 s
+        for s in "${sessions[@]}"; do
+            printf '  %d) %s\n' "$i" "$s"
+            [ "$kind" = "live" ] && _describe_live_session "$s" || _describe_snapshot "$s"
+            i=$((i + 1))
+        done
+        echo
+    } >&2
+    local choice
+    while true; do
+        printf '请输入序号 [1-%d]（q 退出）: ' "$n" >&2
+        read -r choice </dev/tty || { echo ""; return 1; }
+        case "$choice" in
+            q|Q) echo ""; return 1;;
+            '') continue;;
+            *[!0-9]*) echo "  请输入数字" >&2;;
+            *) if [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+                   echo "${sessions[$((choice-1))]}"; return 0
+               fi; echo "  序号超出范围" >&2;;
+        esac
+    done
+}
+
+# 探测 tmux server 状态（带超时，避免被卡死的 server 永久挂起）。
+# 返回: 0=响应正常, 1=没有 server(未启动), 2=有 socket 但无响应(疑似卡死)。
+_tmux_status() {
+    # 没有任何 tmux 进程 → 直接判未启动，不必探测
+    if ! pgrep -x tmux >/dev/null 2>&1; then
+        return 1
+    fi
+    # 后台跑 tmux info，PROBE_TIMEOUT 秒内没结束就判定卡死
+    tmux info >/dev/null 2>&1 &
+    local pid=$!
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 0.2
+        waited=$((waited + 1))
+        if [ "$waited" -ge "$((PROBE_TIMEOUT * 5))" ]; then
+            kill -9 "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            return 2          # 超时 → 卡死
+        fi
+    done
+    wait "$pid" 2>/dev/null
+    if [ "$?" -eq 0 ]; then return 0; else return 2; fi
+}
+
+# 强制杀掉卡死的 tmux server。
+_kill_tmux_server() {
+    echo "正在强制结束 tmux server…" >&2
+    tmux kill-server >/dev/null 2>&1 &
+    local pid=$!; local w=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 0.2; w=$((w + 1)); [ "$w" -ge 10 ] && break
+    done
+    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    # kill-server 卡住的话，直接 kill 进程兜底
+    if pgrep -x tmux >/dev/null 2>&1; then
+        pkill -9 -x tmux 2>/dev/null
+        sleep 0.3
+    fi
+    if pgrep -x tmux >/dev/null 2>&1; then
+        echo "⚠️  仍有 tmux 进程残留，请手动检查: pgrep -x tmux" >&2
+        return 1
+    fi
+    echo "✅ tmux server 已结束" >&2
+    return 0
+}
+
+cmd_start() {
+    if [ -n "${TMUX:-}" ]; then
+        echo "已在 tmux 内。保存请运行: tmux-pilot save" >&2; return 1
+    fi
+
+    # 启动前先探测 tmux server 是否还活着（带超时，应对卡死）
+    _tmux_status; local st=$?
+    if [ "$st" -eq 2 ]; then
+        echo "⚠️  检测到 tmux server 无响应（疑似卡死，${PROBE_TIMEOUT}s 内未应答）。" >&2
+        echo "    最近一次快照仍在，kill 后可从快照恢复布局与 claude 会话。" >&2
+        local ans=""
+        printf '是否强制 kill 掉卡死的 tmux server？[y/N] ' >&2
+        read -r ans </dev/tty 2>/dev/null || ans=""
+        case "$ans" in
+            y|Y|yes|YES)
+                if ! _kill_tmux_server; then return 1; fi
+                ;;
+            *)
+                echo "已取消。可稍后手动处理: tmux kill-server（或 pkill -9 -x tmux）" >&2
+                return 1
+                ;;
+        esac
+        # kill 后 server 已无，走下面的快照恢复 / 新建流程
+    fi
+
+    start_monitor
+
+    local live=() s
+    if [ "$st" -eq 0 ] && tmux info >/dev/null 2>&1; then
+        while IFS= read -r s; do [ -n "$s" ] && live+=("$s"); done \
+            < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    fi
+    local n=${#live[@]}
+
+    if [ "$n" -eq 1 ]; then
+        echo "进入 session: ${live[0]}"; exec tmux attach -t "${live[0]}"
+    elif [ "$n" -gt 1 ]; then
+        local chosen; chosen=$(choose_session live "${live[@]}")
+        [ -z "$chosen" ] && { echo "未选择，退出"; return 1; }
+        exec tmux attach -t "$chosen"
+    fi
+
+    local snaps=()
+    while IFS= read -r s; do [ -n "$s" ] && snaps+=("$s"); done < <(pilot_list_snapshots)
+    if [ "${#snaps[@]}" -gt 0 ]; then
+        local target
+        if [ "${#snaps[@]}" -eq 1 ]; then
+            target="${snaps[0]}"; echo "发现上次快照: ${target}，正在恢复…"
+        else
+            echo "发现多个快照，请选择要恢复的:"
+            target=$(choose_session snap "${snaps[@]}")
+            [ -z "$target" ] && { echo "未选择，退出"; return 1; }
+        fi
+        pilot_restore "$target"; start_monitor; exec tmux attach -t "$target"
+    fi
+
+    echo "无现有 session / 快照，创建新 tmux session…"
+    local name="${1:-main}"
+    tmux new-session -d -s "$name"; start_monitor; exec tmux attach -t "$name"
+}
+
+cmd_status() {
+    if monitor_running; then
+        echo "✅ 监控运行中 (pid=$(cat "$PID_FILE"), interval=${INTERVAL}s)"
+    else echo "⛔ 监控未运行"; fi
+    echo
+    echo "快照目录: $PILOT_SNAP_DIR"
+    local snaps; snaps=$(pilot_list_snapshots)
+    if [ -n "$snaps" ]; then
+        echo "已保存快照:"
+        echo "$snaps" | while read -r s; do
+            local f="$PILOT_SNAP_DIR/$s.snap" wins panes cl
+            wins=$(awk -F'\t' '$1=="win"' "$f" | wc -l | tr -d ' ')
+            panes=$(awk -F'\t' '$1=="pane"' "$f" | wc -l | tr -d ' ')
+            cl=$(awk -F'\t' '$1=="pane" && $8!="-"' "$f" | wc -l | tr -d ' ')
+            echo "  - $s  ($wins win, $panes pane, $cl claude)  [$(stat -f '%Sm' -t '%H:%M:%S' "$f" 2>/dev/null)]"
+        done
+    else echo "（暂无快照）"; fi
+}
+
+cmd_stop() {
+    if monitor_running; then
+        local pid; pid=$(cat "$PID_FILE")
+        kill "$pid" 2>/dev/null && echo "已停止监控 (pid=$pid)"; rm -f "$PID_FILE"
+    else echo "监控未运行"; fi
+}
+
+# 历史版本追溯。
+#   tmux-pilot history              列出所有有历史的 session 及份数
+#   tmux-pilot history <name>       列出该 session 的全部历史版本（时间戳）
+#   tmux-pilot history <name> <ts>  把指定历史版本恢复为「当前」.snap（恢复前自动归档现状）
+cmd_history() {
+    local s="${1:-}" ts="${2:-}"
+    local hroot="$PILOT_SNAP_DIR/history"
+    if [ -z "$s" ]; then
+        if [ ! -d "$hroot" ]; then echo "（暂无历史版本）"; return 0; fi
+        echo "历史版本目录: $hroot"
+        local d cnt
+        for d in "$hroot"/*/; do
+            [ -d "$d" ] || continue
+            cnt=$(ls "$d"/*.snap 2>/dev/null | wc -l | tr -d ' ')
+            [ "$cnt" -eq 0 ] && continue
+            echo "  - $(basename "$d")  ($cnt 个版本)"
+        done
+        echo
+        echo "查看某 session: tmux-pilot history <name>"
+        return 0
+    fi
+    local hdir="$hroot/$s"
+    [ -d "$hdir" ] || { echo "session '$s' 无历史版本" >&2; return 1; }
+    if [ -z "$ts" ]; then
+        echo "'$s' 的历史版本（旧→新）:"
+        local f base wins panes cl
+        for f in $(ls "$hdir"/*.snap 2>/dev/null | sort); do
+            base=$(basename "$f" .snap)
+            wins=$(awk -F'\t' '$1=="win"' "$f" | wc -l | tr -d ' ')
+            panes=$(awk -F'\t' '$1=="pane"' "$f" | wc -l | tr -d ' ')
+            cl=$(awk -F'\t' '$1=="pane" && $8!="-"' "$f" | wc -l | tr -d ' ')
+            echo "  $base  ($wins win, $panes pane, $cl claude)"
+        done
+        echo
+        echo "恢复某版本为当前快照: tmux-pilot history $s <时间戳>"
+        return 0
+    fi
+    # 把指定历史版本提升为当前 .snap（先把现状归档，避免丢失）
+    local src="$hdir/${ts}.snap"
+    [ -f "$src" ] || { echo "找不到版本: $ts（用 tmux-pilot history $s 查看可选值）" >&2; return 1; }
+    local cur="$PILOT_SNAP_DIR/${s}.snap"
+    [ -f "$cur" ] && _archive_snapshot "$s" "$cur"
+    cp -p "$src" "$cur"
+    echo "✅ 已将 '$s' 的历史版本 $ts 设为当前快照"
+    echo "   现在可以: tmux-pilot restore $s"
+}
+
+cmd_help() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ============================================================
+# 入口
+# ============================================================
+case "${1:-start}" in
+    start|"")       shift 2>/dev/null; cmd_start "$@";;
+    save)           pilot_save && echo "✅ 已保存: $(pilot_list_snapshots | tr '\n' ' ')";;
+    restore)        shift; pilot_restore "${1:?用法: tmux-pilot restore <name>}";;
+    panes)          cmd_panes;;
+    status)         cmd_status;;
+    history)        shift; cmd_history "$@";;
+    monitor)        start_monitor; echo "后台监控已启动";;
+    stop)           cmd_stop;;
+    __monitor)      _monitor_loop;;   # 内部用：后台循环本体
+    help|-h|--help) cmd_help;;
+    *)              echo "未知命令: $1（tmux-pilot help 查看）" >&2; exit 1;;
+esac

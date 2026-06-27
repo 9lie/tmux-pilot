@@ -1,0 +1,7 @@
+# tmux-pilot runtime data
+*.log
+*.pid
+
+# OS / editor
+.DS_Store
+*.swp
